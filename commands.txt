@@ -1,0 +1,11 @@
+1.) python manage.py fetch_tasklytics_emails --base-url "https://api.tasklytics.eu" --login "jacek.rakoczy" --password "Jacek2021" --mailbox-id 1177807 --folders "INBOX,SENT" --msg-per-page 200 --page-from 1 --page-to 10
+
+2.) python manage.py convert_html_to_string
+
+3.) python manage.py assign_threads
+
+4.) python manage.py fill_text_processed
+
+5.) python manage.py fill_text_processed_threadaware
+
+
