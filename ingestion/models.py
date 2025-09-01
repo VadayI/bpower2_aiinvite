@@ -167,10 +167,12 @@ class EmailMessage(models.Model):
 
     text_processed = models.TextField(
         null=True, blank=True,
-        verbose_name="tekst przygotowany",
-        help_text="Przygotowany tekst"
+        verbose_name="Przygotowany tekst"
     )
-
+    formatted_text = models.BooleanField(
+        default=False,
+        verbose_name="Sformatowany tekst",
+    )
 
     is_unread = models.BooleanField(
         null=True, blank=True,

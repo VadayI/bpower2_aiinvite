@@ -8,4 +8,5 @@
 
 5.) python manage.py fill_text_processed_threadaware
 
+6.) python manage.py seed_dictionaries
 

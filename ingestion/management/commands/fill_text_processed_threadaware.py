@@ -221,7 +221,7 @@ class Command(BaseCommand):
         parser.add_argument("--overlap", type=int, default=500, help="Ile znaków porównywać na końcu/początku.")
 
     def _base_queryset(self, since: Optional[str]):
-        qs = EmailMessage.objects.all()
+        qs = EmailMessage.objects.filter(formatted_text=False)
         if since:
             qs = qs.filter(Q(sent_at__date__gte=since) | Q(received_at__date__gte=since))
         return qs.only("id", "thread_id", "text_processed", "sent_at", "received_at").order_by("id")
@@ -262,7 +262,8 @@ class Command(BaseCommand):
 
             # zawsze nadpisujemy text_processed
             msg.text_processed = cleaned
-            msg.save(update_fields=["text_processed"])
+            msg.formatted_text = True
+            msg.save(update_fields=["text_processed", "formatted_text"])
             updated += 1
 
         if dry:

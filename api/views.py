@@ -218,7 +218,7 @@ class MessageViewSet(viewsets.ReadOnlyModelViewSet):
         except KeyError:
             return EmailMessage.objects.none()
 
-        qs = EmailMessage.objects.exclude(from_person=F("delivered_to"))
+        qs = EmailMessage.objects.exclude(Q(from_person=F("delivered_to")) | Q(text_processed=False))
 
         # useless
         if only_useless:
