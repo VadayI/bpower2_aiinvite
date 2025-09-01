@@ -1,5 +1,6 @@
 import logging
 
+from django.conf import settings
 from django.db import models
 from django.db.models import Q, Exists, OuterRef, Count, Max, Sum, F
 from django.db import transaction
@@ -27,10 +28,10 @@ from .serializers import PersonSerializer, EmailMessageSerializer, ThreadSeriali
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-OPENAI_MODEL_NAME = "openai"            # etykieta dostawcy
-OPENAI_MODEL_VERSION = "gpt-5"          # wersja/model (spójna z chatgpt_client)
-DEFAULT_PREPROCESS_VERSION = "v1"
-OPENAI_API_KEY = ""
+OPENAI_MODEL_NAME = settings.OPENAI_MODEL_NAME
+OPENAI_MODEL_VERSION = settings.OPENAI_MODEL_VERSION
+DEFAULT_PREPROCESS_VERSION = settings.DEFAULT_PREPROCESS_VERSION
+OPENAI_API_KEY = settings.OPENAI_API_KEY
 
 
 # --------------- Auth -------------------------------------------------------

@@ -18,6 +18,11 @@ env = environ.Env(
     DEBUG=(bool, False)
 )
 
+OPENAI_MODEL_NAME = env('OPENAI_MODEL_NAME')
+OPENAI_MODEL_VERSION = env('OPENAI_MODEL_VERSION')
+DEFAULT_PREPROCESS_VERSION = env('DEFAULT_PREPROCESS_VERSION')
+OPENAI_API_KEY = env('OPENAI_API_KEY')
+
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -57,6 +62,7 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    "corsheaders", 
     "rest_framework",
     'rest_framework.authtoken',
     "api",
