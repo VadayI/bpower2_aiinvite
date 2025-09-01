@@ -92,7 +92,7 @@ def build_kind_catalog_text(enums: Dict[str, Any]) -> str:
         codes_preview = ", ".join(data["codes"]) if data["codes"] else "(brak wartości)"
         value_descriptions_preview = "\n".join([f'-- {k}: {data["value_descriptions"][k]}' for k in data["value_descriptions"]]) if data["value_descriptions"] else "(brak wartości)"
 
-        lines.append(f"{kind_code} - {enums["kinds"][kind_code]["description"]}")
+        lines.append(f"{kind_code} - {enums['kinds'][kind_code]['description']}")
         lines.append(f"- {kind_code}: {codes_preview}")
         lines.append(value_descriptions_preview)
     

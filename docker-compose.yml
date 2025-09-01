@@ -1,0 +1,24 @@
+services:
+  web:
+    build:
+      context: .
+    mem_limit: 8g
+    mem_reservation: 6g
+    env_file:
+      - .env
+    command: >
+      sh -c "
+        python manage.py migrate &&
+        python manage.py collectstatic --noinput &&
+        gunicorn tazu_matching_system.wsgi:application --bind 0.0.0.0:8000 --workers 2 --timeout 600
+      "
+    volumes:
+      - .:/app
+      - media_volume:/app/media
+    ports:
+      - "8323:8000"
+    restart: always
+
+volumes:
+  media_volume:
+  static_volume:

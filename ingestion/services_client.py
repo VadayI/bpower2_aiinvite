@@ -1,8 +1,8 @@
 import base64
 import hashlib
 import requests
-from typing import Dict, Generator, Mapping, Optional
-
+from typing import Dict, Generator, Mapping, Optional, List
+import time
 
 class TasklyticsClient:
     """
@@ -80,6 +80,33 @@ class TasklyticsClient:
             page += 1
             if page > page_to:
                 break
+            time.sleep(5)
+
+            
+    def fetch_message_ids_page(
+        self, mailbox_id: int, folder: str, *, page: int, message_per_page: int = 100
+    ) -> List[str]:
+        """
+        Pobierz JEDNĄ stronę identyfikatorów wiadomości z folderu.
+        Zwraca listę message_id (string).
+        """
+        url = f"{self.base_url}/app/email/message/mails"
+        params = {
+            "page": page,
+            "messagePerPage": message_per_page,
+            "mailBoxId": mailbox_id,
+            "folder": folder,
+        }
+        resp = self._get(url, params=params)
+        payload = resp.json()
+        rows = (payload.get("default") or {}).get("data") or []
+        out: List[str] = []
+        for row in rows:
+            mid = row.get("Id") or row.get("id") or row.get("messageId")
+            if mid:
+                out.append(str(mid))
+        return out
+
 
     def fetch_details(self, mailbox_id: int, message_id: str) -> Mapping:
         url = f"{self.base_url}/app/email/message/details"
