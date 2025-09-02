@@ -1,9 +1,11 @@
 import logging
 
 from django.conf import settings
-from django.db import models
-from django.db.models import Q, Exists, OuterRef, Count, Max, Sum, F
+from django.db.models import (
+    Sum, F, Q, Value, IntegerField, OuterRef, Subquery, Max, Case, When
+)
 from django.db import transaction
+from django.db.models.functions import Coalesce
 
 from rest_framework import viewsets, mixins, status, permissions
 from rest_framework.decorators import action
@@ -73,14 +75,39 @@ class PersonViewSet(viewsets.ReadOnlyModelViewSet):
     pagination_class = DynamicMaxPage
 
     def get_queryset(self):
-        # zliczamy wysłane (from_person) i dostarczone (delivered_to)
+        # --- Subquery: sumy z PartnerStat, gdy osoba jest po stronie 'a' lub 'b' ---
+        sum_as_a = PartnerStat.objects.filter(a=OuterRef("pk")) \
+            .values("a") \
+            .annotate(s=Sum("msg_count")) \
+            .values("s")[:1]
+
+        sum_as_b = PartnerStat.objects.filter(b=OuterRef("pk")) \
+            .values("b") \
+            .annotate(s=Sum("msg_count")) \
+            .values("s")[:1]
+
+        sum_proc_as_a = PartnerStat.objects.filter(a=OuterRef("pk")) \
+            .values("a") \
+            .annotate(s=Sum("msg_processed_count")) \
+            .values("s")[:1]
+
+        sum_proc_as_b = PartnerStat.objects.filter(b=OuterRef("pk")) \
+            .values("b") \
+            .annotate(s=Sum("msg_processed_count")) \
+            .values("s")[:1]
+
         qs = (
             Person.objects
             .annotate(
-                sent_count=Count("sent_messages", distinct=True),
-                recv_count=Count("delivered_messages", distinct=True),
+                total_from_a=Coalesce(Subquery(sum_as_a, output_field=IntegerField()), Value(0)),
+                total_from_b=Coalesce(Subquery(sum_as_b, output_field=IntegerField()), Value(0)),
+                total_proc_from_a=Coalesce(Subquery(sum_proc_as_a, output_field=IntegerField()), Value(0)),
+                total_proc_from_b=Coalesce(Subquery(sum_proc_as_b, output_field=IntegerField()), Value(0)),
             )
-            .annotate(total_messages=F("sent_count") + F("recv_count"))
+            .annotate(
+                total_messages=F("total_from_a") + F("total_from_b"),
+                total_processed=F("total_proc_from_a") + F("total_proc_from_b"),
+            )
             .order_by("-total_messages", "email")
         )
         return qs
@@ -90,44 +117,36 @@ class PersonViewSet(viewsets.ReadOnlyModelViewSet):
         aggregate = qs.aggregate(s=Sum("total_messages"))
         max_total = aggregate["s"] or 0
 
-        # ustaw w paginatorze dynamiczny max_page_size
         if self.paginator:
             self.paginator.max_page_size = max_total or self.paginator.max_page_size
             setattr(self.paginator, "dynamic_max_page_size", self.paginator.max_page_size)
 
         return super().list(request, *args, **kwargs)
 
-
     @action(detail=True, methods=["get"])
     def partners(self, request, pk=None):
         person = self.get_object()
 
-        # Bierz wiersze gdzie a=person lub b=person; wyznacz 'partner_id' jako „druga strona”
         stats = (
             PartnerStat.objects
-            .exclude(a=F('b'))
+            .exclude(a=F("b"))  # para musi być nieuporządkowana, ale nie a==b
             .filter(Q(a=person) | Q(b=person))
             .annotate(
-                partner_id=F("b_id")
+                partner_id=Case(
+                    When(a_id=person.id, then=F("b_id")),
+                    default=F("a_id"),
+                    output_field=IntegerField(),
+                )
             )
+            .order_by("-msg_count", "-last_message_at")
         )
-        # Gdy a=person, partner to b; gdy b=person – partner to a.
-        stats = stats.annotate(
-            partner_id=models.Case(
-                models.When(a_id=person.id, then=F("b_id")),
-                default=F("a_id"),
-                output_field=models.IntegerField(),
-            )
-        ).order_by("-msg_count", "-last_message_at")
 
-        # Pobierz dane partnerów (1 query)
-        partner_map = {
-            p.id: p for p in Person.objects.filter(id__in=stats.values_list("partner_id", flat=True))
-        }
+        partner_ids = list(stats.values_list("partner_id", flat=True))
+        partners = {p.id: p for p in Person.objects.filter(id__in=partner_ids)}
 
         data = []
         for s in stats:
-            p = partner_map.get(s.partner_id)
+            p = partners.get(s.partner_id)
             if not p:
                 continue
             data.append({
@@ -154,7 +173,7 @@ class PersonViewSet(viewsets.ReadOnlyModelViewSet):
 
         partner = Person.objects.get(pk=partner_id)
 
-        # helper Exists
+        from django.db.models import Exists, OuterRef  # upewnij się, że masz import
         def involves(p):
             return Q(from_person=p) | Q(delivered_to=p) | Exists(
                 MessageRecipient.objects.filter(message=OuterRef("pk"), person=p)
@@ -171,6 +190,7 @@ class PersonViewSet(viewsets.ReadOnlyModelViewSet):
             .order_by("-last_activity_at","-id")
         )
         return Response(ThreadSerializer(threads, many=True).data)
+    
 
 def _get_bool(request, name: str, default: bool) -> bool:
     val = request.query_params.get(name, None)
