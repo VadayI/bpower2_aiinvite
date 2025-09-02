@@ -1,7 +1,8 @@
 from django.contrib import admin
-from django.db.models import Count
+from django.db.models import Count, Sum, OuterRef, Subquery, IntegerField, Value
 from django.utils.html import strip_tags
 from django.utils.text import Truncator
+from django.db.models.functions import Coalesce
 
 from .models import Person, Thread, EmailMessage, MessageRecipient,\
     PartnerStat
@@ -100,10 +101,21 @@ class PersonAdmin(admin.ModelAdmin):
 
     def get_queryset(self, request):
         qs = super().get_queryset(request)
-        # Anotacje liczników
+
+        # sumy gdy osoba jest w kolumnie a (nadawca) albo b (odbiorca)
+        sum_as_a = PartnerStat.objects.filter(a=OuterRef("pk")) \
+            .values("a") \
+            .annotate(s=Sum("msg_count")) \
+            .values("s")[:1]
+
+        sum_as_b = PartnerStat.objects.filter(b=OuterRef("pk")) \
+            .values("b") \
+            .annotate(s=Sum("msg_count")) \
+            .values("s")[:1]
+
         return qs.annotate(
-            _sent=Count("sent_messages", distinct=True),
-            _received=Count("received_messages", distinct=True),
+            _sent=Coalesce(Subquery(sum_as_a, output_field=IntegerField()), Value(0)),
+            _received=Coalesce(Subquery(sum_as_b, output_field=IntegerField()), Value(0)),
         )
 
     @admin.display(description="wysłane", ordering="_sent")
@@ -113,7 +125,6 @@ class PersonAdmin(admin.ModelAdmin):
     @admin.display(description="otrzymane", ordering="_received")
     def received_count(self, obj: Person):
         return obj._received
-
 
 # -----------------------------
 # Thread
