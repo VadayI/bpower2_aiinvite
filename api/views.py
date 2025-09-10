@@ -2,7 +2,7 @@ import logging
 
 from django.conf import settings
 from django.db.models import (
-    Sum, F, Q, Value, IntegerField, OuterRef, Subquery, Max, Case, When
+    Sum, F, Q, Value, IntegerField, OuterRef, Subquery, Max, Case, When, Count
 )
 from django.db import transaction
 from django.db.models.functions import Coalesce
@@ -15,7 +15,7 @@ from rest_framework.authtoken.views import ObtainAuthToken
 from rest_framework.authtoken.models import Token
 from rest_framework.views import APIView
 
-from ingestion.models import EmailMessage, PartnerStat, Person, MessageRecipient
+from ingestion.models import EmailMessage, PartnerStat, Person, MessageRecipient, Thread
 
 # Używamy *dynamicznych* helperów z chatgpt_client:
 from dataset.chatgpt_client import (
@@ -25,7 +25,8 @@ from dataset.chatgpt_client import (
 
 from dataset.models import Dictionary, DictionaryKind, DictionaryValue, DatasetSample, \
     Annotation, LabelFinal, DictionaryKind, DictionaryValue, ModelPrediction
-from .serializers import PersonSerializer, EmailMessageSerializer, ThreadSerializer
+from .serializers import PersonSerializer, EmailMessageSerializer, ThreadSerializer, \
+    ThreadSerializer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -313,6 +314,106 @@ class MessageViewSet(viewsets.ReadOnlyModelViewSet):
             msg.save(update_fields=["user_processed"])
         return Response({"id": msg.id, "user_processed": True}, status=status.HTTP_200_OK)
 
+
+class ThreadViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    GET /api/threads?person=<id>&with=<id>
+        [&only_useless=true|false]         (domyślnie false)
+        [&with_useless=true|false]         (domyślnie true)
+        [&only_user_processed=true|false]  (domyślnie false)
+        [&with_user_processed=true|false]  (domyślnie true)
+        [&kinds=TO|TO,CC,BCC]              (domyślnie TO – tak jak w MessageViewSet)
+        [&since=YYYY-MM-DD]                (opcjonalnie ograniczenie czasu na bazie sent_at/received_at)
+
+    Zwraca wątki, które mają co najmniej jedną wiadomość spełniającą regułę:
+      from_person ↔ (delivered_to ∪ recipients[kinds]) – w obu kierunkach, między person i with.
+    """
+    serializer_class = ThreadSerializer
+    pagination_class = SmallPage
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        params = self.request.query_params
+        person_id = params.get("person")
+        with_id = params.get("with")
+        since = params.get("since")
+
+        if not person_id or not with_id:
+            # wymagamy obu identyfikatorów, bo to 'wątki między wskazanymi osobami'
+            return Thread.objects.none()
+        try:
+            a_id = int(person_id)
+            b_id = int(with_id)
+        except (TypeError, ValueError):
+            return Thread.objects.none()
+
+        # kinds (TO/CC/BCC)
+        try:
+            kind_values = _parse_kinds(params.get("kinds"))
+        except KeyError:
+            return Thread.objects.none()
+
+        only_useless = _get_bool(self.request, "only_useless", False)
+        with_useless = _get_bool(self.request, "with_useless", True)
+        only_user_processed = _get_bool(self.request, "only_user_processed", False)
+        with_user_processed = _get_bool(self.request, "with_user_processed", True)
+
+        # Mikro-optymalizacja: sprawdź w PartnerStat, czy para w ogóle istnieje
+        x, y = (a_id, b_id) if a_id < b_id else (b_id, a_id)
+        if not PartnerStat.objects.filter(a_id=x, b_id=y).exists():
+            return Thread.objects.none()
+
+        # Bazowe QS po wiadomościach – *tylko* te, które pasują do filtrów "useless/user_processed/since"
+        msgs = EmailMessage.objects.all()
+
+        # useless
+        if only_useless:
+            msgs = msgs.filter(useless=True)
+        elif not with_useless:
+            msgs = msgs.exclude(useless=True)
+
+        # user_processed
+        if only_user_processed:
+            msgs = msgs.filter(user_processed=True)
+        elif not with_user_processed:
+            msgs = msgs.exclude(user_processed=True)
+
+        # since (po sent_at/received_at – którakolwiek z dat musi spełniać warunek)
+        if since:
+            msgs = msgs.filter(Q(sent_at__date__gte=since) | Q(received_at__date__gte=since))
+
+        # Reguła pary, identyczna jak w MessageViewSet:
+        pair_q = (
+            Q(from_person_id=a_id) & (
+                Q(delivered_to_id=b_id) |
+                Q(message_recipients__person_id=b_id,
+                  message_recipients__kind__in=kind_values)
+            )
+        ) | (
+            Q(from_person_id=b_id) & (
+                Q(delivered_to_id=a_id) |
+                Q(message_recipients__person_id=a_id,
+                  message_recipients__kind__in=kind_values)
+            )
+        )
+        msgs = msgs.filter(pair_q)
+
+        # Z tego subzapytania budujemy QS wątków:
+        #  - tylko wątki, które mają co najmniej jedną taką wiadomość,
+        #  - adnotujemy liczbę takich wiadomości i "ostatnią aktywność" (max z sent_at/received_at).
+        threads = (
+            Thread.objects
+            .filter(messages__in=msgs)
+            .annotate(
+                matched_messages=Count("messages", filter=Q(messages__in=msgs), distinct=True),
+                last_activity=Max(Coalesce("messages__received_at", "messages__sent_at")),
+            )
+            .order_by("-last_activity", "-id")
+            .distinct()
+        )
+
+        # Dodatkowo możesz chcieć prefetch/only, ale to zależy od Twojego ThreadSerializer
+        return threads
 
 # ------------------- SŁOWNIKI (dynamicznie) ---------------------------------
 

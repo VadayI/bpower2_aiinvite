@@ -9,6 +9,7 @@ from .views import (
     LabelViewSet,
     TokenAuthView,
     LabelPreviewView,
+    ThreadViewSet
 )
 
 router = DefaultRouter()
@@ -18,6 +19,8 @@ router.register(r"dictionaries", DictionaryViewSet, basename="dictionaries")
 router.register(r"dict-kinds", DictionaryKindViewSet, basename="dict-kinds")
 router.register(r"dict-values", DictionaryValueViewSet, basename="dict-values")
 router.register(r"labels", LabelViewSet, basename="labels")
+router.register(r"threads", ThreadViewSet, basename="threads")
+
 
 urlpatterns = [
     path("token-auth/", TokenAuthView.as_view(), name="token-auth"),  # <-- /api/token-auth/

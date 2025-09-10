@@ -23,12 +23,12 @@ class PartnerWithCountSerializer(serializers.Serializer):
 
 
 class ThreadSerializer(serializers.ModelSerializer):
-    message_count = serializers.IntegerField()
-    last_activity_at = serializers.DateTimeField()
+    matched_messages = serializers.IntegerField(read_only=True)
+    last_activity = serializers.DateTimeField(read_only=True)
 
     class Meta:
         model = Thread
-        fields = ("id", "thread_key", "subject_norm", "message_count", "last_activity_at")
+        fields = ["id", "thread_key", "subject_norm", "created_at", "matched_messages", "last_activity"]
 
 
 # ---- Słowniki (zestaw / rodzaje / wartości) ----

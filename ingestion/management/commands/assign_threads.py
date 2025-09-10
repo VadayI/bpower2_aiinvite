@@ -1,12 +1,13 @@
+# assign_threads.py
 import re
 from typing import Optional, Sequence
 
-from django.core.management.base import BaseCommand
+from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
-from django.db.models import Q, QuerySet
+from django.db.models import Q, QuerySet, Exists, OuterRef
 from django.utils.text import slugify
 
-from ingestion.models import EmailMessage, Thread
+from ingestion.models import EmailMessage, Thread, Person
 
 
 # ===== Helpers =====
@@ -21,9 +22,9 @@ def normalize_subject(subject: str) -> str:
     if not subject:
         return ""
     s = subject.strip()
-    # wycinamy powtarzające się prefiksy (np. Re: Re: Fwd:)
     s_low = s.lower()
     changed = True
+    # wycinamy powtarzające się prefiksy (np. Re: Re: Fwd:)
     while changed and s_low:
         changed = False
         for p in _SUBJECT_PREFIXES:
@@ -39,7 +40,6 @@ def extract_references(ref_header: str) -> Sequence[str]:
     """Zwraca listę Message-ID z nagłówka References (bez nawiasów <>)."""
     if not ref_header:
         return []
-    # Preferujemy dopasowanie <...>, a gdy brak — fallback do split
     in_brackets = re.findall(r"<([^>]+)>", ref_header)
     if in_brackets:
         return [x.strip() for x in in_brackets if x.strip()]
@@ -59,7 +59,7 @@ def find_parent_thread(msg: EmailMessage) -> Optional[Thread]:
         if parent and parent.thread:
             return parent.thread
 
-    # 2) Po References (bierzemy pierwszą dopasowaną istniejącą wiadomość z wątkiem)
+    # 2) Po References (pierwsza dopasowana wiadomość z wątkiem)
     if msg.references_header:
         refs = extract_references(msg.references_header)
         if refs:
@@ -124,12 +124,35 @@ def assign_thread_for_message(msg: EmailMessage, allow_subject_fallback: bool = 
     return thread
 
 
+# ===== Filtry osób (A i/lub B) =====
+
+def _exists_recipient(person_id: int):
+    from ingestion.models import MessageRecipient  # lokalny import, by uniknąć cykli
+    return Exists(
+        MessageRecipient.objects.filter(message=OuterRef("pk"), person_id=person_id)
+    )
+
+def q_involves_person(person_id: int) -> Q:
+    """
+    Czy wiadomość angażuje daną osobę (nadawca, adresat, delivered_to)?
+    """
+    return Q(from_person_id=person_id) | Q(delivered_to_id=person_id) | _exists_recipient(person_id)
+
+def q_between(person_a_id: int, person_b_id: int) -> Q:
+    """
+    Czy wiadomość angażuje OBU uczestników (A i B) — w dowolnych rolach.
+    """
+    return q_involves_person(person_a_id) & q_involves_person(person_b_id)
+
+
 # ===== Management Command =====
 
 class Command(BaseCommand):
     help = (
         "Przypisuje wątki (Thread) dla wiadomości EmailMessage na podstawie "
-        "In-Reply-To, References i (opcjonalnie) znormalizowanego tematu."
+        "In-Reply-To, References i (opcjonalnie) znormalizowanego tematu. "
+        "Można ograniczyć do wiadomości z udziałem wskazanej osoby (--person) "
+        "lub wyłącznie rozmów między dwiema osobami (--person oraz --with-person --only-between)."
     )
 
     def add_arguments(self, parser):
@@ -159,22 +182,54 @@ class Command(BaseCommand):
             action="store_true",
             help="Tryb podglądu — nic nie zapisuje, tylko pokazuje planowane działania.",
         )
+        # --- NOWE ARGUMENTY ---
+        parser.add_argument(
+            "--person",
+            type=int,
+            help="ID osoby (Person.id), której wiadomości mają być brane pod uwagę.",
+        )
+        parser.add_argument(
+            "--with-person",
+            type=int,
+            help="ID rozmówcy (Person.id). Użyj z --person; w połączeniu z --only-between ograniczy do wiadomości angażujących OBU.",
+        )
+        parser.add_argument(
+            "--only-between",
+            action="store_true",
+            help="Wymagaj współwystąpienia obu osób (--person i --with-person) w tej samej wiadomości.",
+        )
 
-    def _base_queryset(self, process_all: bool, since: Optional[str]) -> QuerySet[EmailMessage]:
+    def _base_queryset(
+        self,
+        process_all: bool,
+        since: Optional[str],
+        person_id: Optional[int],
+        with_person_id: Optional[int],
+        only_between: bool,
+    ) -> QuerySet[EmailMessage]:
         qs = EmailMessage.objects.all().order_by("id")
         if not process_all:
             qs = qs.filter(thread__isnull=True)
         if since:
-            # bierzemy po obu datach (jeśli któraś jest pusta, druga zadziała)
-            qs = qs.filter(
-                Q(sent_at__date__gte=since) | Q(received_at__date__gte=since)
-            )
+            qs = qs.filter(Q(sent_at__date__gte=since) | Q(received_at__date__gte=since))
+
+        # --- Filtry po osobach ---
+        if person_id and with_person_id and only_between:
+            qs = qs.filter(q_between(person_id, with_person_id))
+        elif person_id and with_person_id:
+            # dowolna wiadomość z udziałem którejkolwiek z tych dwóch osób
+            qs = qs.filter(q_involves_person(person_id) | q_involves_person(with_person_id))
+        elif person_id:
+            qs = qs.filter(q_involves_person(person_id))
+        elif with_person_id:
+            qs = qs.filter(q_involves_person(with_person_id))
+
         return qs.select_related("thread").only(
             "id", "thread_id", "subject",
             "message_id_header", "external_message_id",
             "in_reply_to_header", "references_header",
             "sent_at", "received_at",
-        )
+        ).distinct()
 
     def handle(self, *args, **opts):
         process_all = bool(opts.get("all"))
@@ -183,18 +238,45 @@ class Command(BaseCommand):
         dry_run = bool(opts.get("dry_run"))
         allow_subject_fallback = not bool(opts.get("no_subject_fallback"))
 
-        qs = self._base_queryset(process_all, since)
+        person_id = opts.get("person")
+        with_person_id = opts.get("with_person")
+        only_between = bool(opts.get("only_between"))
+
+        # walidacja pary
+        if only_between and not (person_id and with_person_id):
+            raise CommandError("--only-between wymaga podania obu: --person oraz --with-person.")
+
+        # (opcjonalne) sprawdzenie, czy osoby istnieją
+        def _check_person(pid):
+            try:
+                return Person.objects.only("id", "email", "display_name").get(pk=pid)
+            except Person.DoesNotExist:
+                raise CommandError(f"Person.id={pid} nie istnieje.")
+
+        p_a = _check_person(person_id) if person_id else None
+        p_b = _check_person(with_person_id) if with_person_id else None
+
+        qs = self._base_queryset(process_all, since, person_id, with_person_id, only_between)
         total = qs.count() if limit == 0 else min(limit, qs.count())
 
         if total == 0:
             self.stdout.write(self.style.WARNING("Brak wiadomości do przetworzenia."))
             return
 
+        filt_info = []
+        if p_a:
+            filt_info.append(f"person={p_a.id}<{p_a.display_name or p_a.email}>")
+        if p_b:
+            filt_info.append(f"with={p_b.id}<{p_b.display_name or p_b.email}>")
+        if only_between and (p_a and p_b):
+            filt_info.append("mode=ONLY_BETWEEN")
+
         self.stdout.write(
             self.style.MIGRATE_HEADING(
-                f"Przypisywanie wątków: {'WSZYSTKIE' if process_all else 'tylko bez wątku'}; "
+                f"Przypisywanie wątków: {'WSZYSTKIE' if process_all else 'bez wątku'}; "
                 f"since={since or '-'}; limit={limit or '∞'}; "
                 f"subject_fallback={'TAK' if allow_subject_fallback else 'NIE'}; "
+                f"{' | '.join(filt_info) if filt_info else 'brak filtrów osób'}; "
                 f"dry_run={'TAK' if dry_run else 'NIE'}"
             )
         )
@@ -210,9 +292,7 @@ class Command(BaseCommand):
             before_thread_id = msg.thread_id
 
             if dry_run:
-                # Symulacja: sprawdzamy, co byśmy przypisali
                 simulated = find_parent_thread(msg)
-                action = None
                 if simulated:
                     action = f"-> thread(parent) {simulated.thread_key}"
                 elif allow_subject_fallback:
@@ -222,23 +302,17 @@ class Command(BaseCommand):
                 else:
                     key = f"msgid:{msg.message_id_header or msg.external_message_id or msg.pk}"
                     action = f"-> thread(msgid) {key}"
-
                 self.stdout.write(f"[DRY] msg#{msg.id} {action}")
                 processed += 1
                 continue
 
-            # Realne przypisanie (każdą wiadomość trzymamy w mini-transakcji)
             with transaction.atomic():
-                assigned_before = Thread.objects.filter(pk=before_thread_id).exists() if before_thread_id else False
                 thread = assign_thread_for_message(msg, allow_subject_fallback=allow_subject_fallback)
 
             processed += 1
             if before_thread_id:
-                reused_threads += 1  # traktujemy jako „już miało” (gdy --all)
+                reused_threads += 1
             else:
-                # heurystyka: jeśli wątek powstał chwilę temu i nie istniał wcześniej,
-                # policz jako created; w przeciwnym wypadku jako reused
-                # (nie idealne, ale wystarczająco informacyjne)
                 if thread and thread.messages.count() <= 1:
                     created_threads += 1
                 else:

@@ -249,6 +249,8 @@ class Command(BaseCommand):
         updated = 0
         seen = 0
 
+        to_process = qs.count()
+
         for msg in qs.iterator(chunk_size=200):
             seen += 1
 
@@ -265,6 +267,10 @@ class Command(BaseCommand):
             msg.formatted_text = True
             msg.save(update_fields=["text_processed", "formatted_text"])
             updated += 1
+
+            # wypisz licznik co 500 wiadomości
+            if seen % 500 == 0:
+                self.stdout.write(f"Przetworzono {seen}/{to_process} wiadomości...")
 
         if dry:
             self.stdout.write(self.style.SUCCESS(f"[DRY] Przetworzono: {seen}, nadpisanych: {updated}"))

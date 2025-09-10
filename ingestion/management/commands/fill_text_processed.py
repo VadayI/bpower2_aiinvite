@@ -1,12 +1,12 @@
 import re
-from django.core.management.base import BaseCommand
 import unicodedata
-
+from django.core.management.base import BaseCommand
 
 from ingestion.models import EmailMessage
 
 # zestaw dozwolonych znaków specjalnych
 CHARACTERS_ALLOWED = set("?!.,*:@<>/_+-()[]{}=|&%$#^~\"'–")
+
 
 def clean_for_training(text: str) -> str:
     """Czyści treść maila do postaci przydatnej dla modeli."""
@@ -34,11 +34,12 @@ def clean_for_training(text: str) -> str:
 
     return text
 
+
 def check_string_is_correct(s: str):
     """
     Sprawdza czy string jest poprawny.
     Dozwolone: litery, cyfry, spacje, polskie znaki i standardowe symbole.
-    Zwraca (bool, lista_błędnych_znaków).
+    Zwraca True/False.
     """
     def is_correct(ch):
         cat = unicodedata.category(ch)
@@ -47,7 +48,7 @@ def check_string_is_correct(s: str):
             or ch.isspace()
             or ch in CHARACTERS_ALLOWED
         )
-    
+
     incorrect = [ch for ch in s if not is_correct(ch)]
     return len(incorrect) == 0
 
@@ -69,14 +70,18 @@ class Command(BaseCommand):
         limit = opts["limit"]
         dry_run = opts["dry_run"]
 
-        qs = EmailMessage.objects.all().only("id", "text_html", "text_plain")
+        qs = EmailMessage.objects.filter(text_processed__isnull=True)\
+            .only("id", "text_html", "text_html_parsed", "text_plain")
 
         if limit:
             qs = qs[:limit]
 
         updated = 0
+        processed = 0
+        to_process = qs.count()
         for msg in qs.iterator(chunk_size=200):
-            text_html = msg.text_html_parsed or ""
+            processed += 1
+            text_html = msg.text_html_parsed or msg.text_html or ""
             text_plain = msg.text_plain or ""
 
             if len(text_html) >= (len(text_plain) * 1.5) and check_string_is_correct(text_html):
@@ -84,16 +89,22 @@ class Command(BaseCommand):
             else:
                 chosen = text_plain
 
-            processed = clean_for_training(chosen)
-            if not processed:
+            processed_text = clean_for_training(chosen)
+            if not processed_text:
                 continue
 
             if dry_run:
-                self.stdout.write(f"[{msg.id}] {processed[:120]}...")
+                self.stdout.write(f"[{msg.id}] {processed_text[:120]}...")
             else:
-                msg.text_processed = processed
+                msg.text_processed = processed_text
                 msg.save(update_fields=["text_processed"])
                 updated += 1
 
+            # wypisz licznik co 500 wiadomości
+            if processed % 500 == 0:
+                self.stdout.write(f"Przetworzono {processed}/{to_process} wiadomości...")
+
         if not dry_run:
             self.stdout.write(self.style.SUCCESS(f"Zaktualizowano {updated} wiadomości."))
+        else:
+            self.stdout.write(self.style.WARNING(f"Dry-run zakończony, przejrzano {processed} wiadomości."))
