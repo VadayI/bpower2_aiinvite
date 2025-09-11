@@ -47,44 +47,6 @@ class HasThreadFilter(admin.SimpleListFilter):
             return queryset.filter(thread__isnull=True)
         return queryset
 
-
-class FromDomainFilter(admin.SimpleListFilter):
-    title = "domena nadawcy"
-    parameter_name = "from_domain"
-
-    def lookups(self, request, model_admin):
-        qs = (
-            Person.objects.exclude(domain="")
-            .values("domain")
-            .annotate(c=Count("id"))
-            .order_by("-c")
-            .values_list("domain", flat=True)[:20]
-        )
-        return [(d, d) for d in qs]
-
-    def queryset(self, request, queryset):
-        v = self.value()
-        return queryset.filter(from_person__domain=v) if v else queryset
-
-
-class ToDomainFilter(admin.SimpleListFilter):
-    title = "domena dostarczenia"
-    parameter_name = "to_domain"
-
-    def lookups(self, request, model_admin):
-        qs = (
-            Person.objects.exclude(domain="")
-            .values("domain")
-            .annotate(c=Count("id"))
-            .order_by("-c")
-            .values_list("domain", flat=True)[:20]
-        )
-        return [(d, d) for d in qs]
-
-    def queryset(self, request, queryset):
-        v = self.value()
-        return queryset.filter(delivered_to__domain=v) if v else queryset
-    
 # -----------------------------
 # Person
 # -----------------------------
@@ -131,8 +93,10 @@ class PersonAdmin(admin.ModelAdmin):
 # -----------------------------
 @admin.register(Thread)
 class ThreadAdmin(admin.ModelAdmin):
-    list_display = ("id", "subject_norm", "thread_key", "messages_count", "created_at")
+    list_display = ("id", "subject_norm", "thread_key", "messages_count", "created_at", 
+                    "user_processed", "useless")
     search_fields = ("subject_norm", "thread_key")
+    list_filter = ("user_processed", "useless",)
     date_hierarchy = "created_at"
     ordering = ("-created_at",)
 
@@ -169,8 +133,6 @@ class EmailMessageAdmin(admin.ModelAdmin):
         "user_processed",
         "useless",
         HasThreadFilter,
-        FromDomainFilter,
-        ToDomainFilter,
         ("sent_at", admin.DateFieldListFilter),
         ("received_at", admin.DateFieldListFilter),
     )

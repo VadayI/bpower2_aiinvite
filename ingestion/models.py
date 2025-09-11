@@ -51,6 +51,15 @@ class Thread(models.Model):
         help_text="Czas utworzenia wątku w systemie."
     )
 
+    user_processed = models.BooleanField(
+        default=False, db_index=True,
+        verbose_name="Etykietowano przez Użytkownika"
+    )
+    useless = models.BooleanField(
+        default=False,
+        verbose_name="Nieprzydatny do nauczenia modeli."
+    )
+
     class Meta:
         verbose_name = "Wątek"
         verbose_name_plural = "Wątki"
