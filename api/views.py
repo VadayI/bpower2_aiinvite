@@ -204,8 +204,8 @@ def _parse_kinds(param: str | None):
     kinds_csv = (param or "TO").upper()
     allowed = {
         "TO": MessageRecipient.Kind.TO,
-        "CC": MessageRecipient.Kind.CC,
-        "BCC": MessageRecipient.Kind.BCC,
+        # "CC": MessageRecipient.Kind.CC,
+        # "BCC": MessageRecipient.Kind.BCC,
     }
     return [allowed[k.strip()] for k in kinds_csv.split(",") if k.strip()]
 
@@ -327,10 +327,35 @@ class ThreadViewSet(viewsets.ReadOnlyModelViewSet):
 
     Zwraca wątki, które mają co najmniej jedną wiadomość spełniającą regułę:
       from_person ↔ (delivered_to ∪ recipients[kinds]) – w obu kierunkach, między person i with.
+
+    Jeśli all=true → zwracamy wszystkie wątki w jednej odpowiedzi (bez paginacji).
+
     """
     serializer_class = ThreadSerializer
     pagination_class = SmallPage
     permission_classes = [permissions.IsAuthenticated]
+
+    def paginate_queryset(self, queryset):
+        """
+        Obsługa parametru all=true → wyłącza paginację.
+        """
+        all_param = self.request.query_params.get("all")
+        if all_param and all_param.lower() in ("1", "true", "yes"):
+            return None  # brak paginacji, przechodzi do get_paginated_response bez użycia paginatora
+        return super().paginate_queryset(queryset)
+
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+
+        # brak paginacji – zwracamy wszystkie
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+
 
     def get_queryset(self):
         params = self.request.query_params

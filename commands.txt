@@ -10,3 +10,4 @@
 
 6.) python manage.py seed_dictionaries
 
+7.) python manage.py sync_partner_stats --batch-size 500

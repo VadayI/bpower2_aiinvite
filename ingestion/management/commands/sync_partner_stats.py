@@ -26,7 +26,7 @@ def _recipient_ids(message_id: int) -> Iterable[int]:
             MessageRecipient.Kind.TO,
             # MessageRecipient.Kind.CC,
             # MessageRecipient.Kind.BCC,
-        ],
+        ]
     ).values_list("person_id", flat=True)
 
 def _message_dt(sent_at, received_at):
@@ -57,8 +57,6 @@ class Command(BaseCommand):
                             help="Ile wiadomości przetwarzać w jednej paczce.")
         parser.add_argument("--since-id", type=int, default=None,
                             help="Opcjonalnie: przetwarzaj tylko EmailMessage o id > since_id.")
-        parser.add_argument("--reset", action="store_true", default=False,
-                            help="Najpierw wyczyść PartnerStat (truncate poprzez delete()).")
         parser.add_argument("--dry-run", action="store_true", default=False,
                             help="Nie zapisuj do bazy – tylko policz i wypisz statystyki.")
         parser.add_argument("--filter-q", dest="filter_q", default=None,
@@ -67,7 +65,6 @@ class Command(BaseCommand):
     def handle(self, *args, **opts):
         batch_size: int = opts["batch_size"]
         since_id: Optional[int] = opts["since_id"]
-        reset: bool = opts["reset"]
         dry_run: bool = opts["dry_run"]
         filter_q_raw: Optional[str] = opts.get("filter_q")
 
@@ -96,7 +93,7 @@ class Command(BaseCommand):
         self.stdout.write(self.style.NOTICE(f"Do przetworzenia: {total_msgs} wiadomości"))
 
         # 2) Opcjonalny reset
-        if reset and not dry_run:
+        if not dry_run:
             self.stdout.write(self.style.WARNING("Kasuję PartnerStat..."))
             PartnerStat.objects.all().delete()
 
@@ -111,11 +108,13 @@ class Command(BaseCommand):
             # Minimalnie: użyj transakcji i update per rekord (bez konfliktów)
             with transaction.atomic():
                 for (a_id, b_id), c in agg.items():
-                    obj, created = PartnerStat.objects.get_or_create(a_id=a_id, b_id=b_id, defaults={
-                        "msg_count": 0,
-                        "msg_processed_count": 0,
-                        "last_message_at": c.last_message_at
-                    })
+                    obj, created = PartnerStat.objects.get_or_create(a_id=a_id, b_id=b_id, 
+                                    defaults={
+                                        "msg_count": 0,
+                                        "msg_processed_count": 0,
+                                        "last_message_at": c.last_message_at
+                                    })
+
                     # zsumuj
                     new_msg = (obj.msg_count or 0) + c.msg_count
                     new_proc = (obj.msg_processed_count or 0) + c.msg_processed_count
