@@ -434,6 +434,7 @@ class ThreadViewSet(viewsets.ReadOnlyModelViewSet):
                 last_activity=Max(Coalesce("messages__received_at", "messages__sent_at")),
             )
             .order_by("-last_activity", "-id")
+            .order_by("-matched_messages", "-last_activity", "-id")
             .distinct()
         )
 
