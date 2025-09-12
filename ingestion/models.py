@@ -206,7 +206,7 @@ class EmailMessage(models.Model):
     class Meta:
         verbose_name = "Wiadomość e-mail"
         verbose_name_plural = "Wiadomości e-mail"
-        ordering = ["-received_at"]
+        ordering = ["received_at"]
 
     def __str__(self) -> str:
         return self.subject or "(brak tematu)"

@@ -318,6 +318,10 @@ class Command(BaseCommand):
                 else:
                     reused_threads += 1
 
+            # >>>>> NOWE: licznik postępu <<<<<
+            if processed % 500 == 0 or processed == total:
+                self.stdout.write(self.style.NOTICE(f"Postęp: {processed}/{total}"))
+
         self.stdout.write("")
         self.stdout.write(self.style.SUCCESS(f"Gotowe. Przetworzono: {processed}"))
         self.stdout.write(self.style.SUCCESS(f"Użyte/istniejące wątki: {reused_threads}"))
