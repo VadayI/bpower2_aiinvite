@@ -3,13 +3,16 @@ from __future__ import annotations
 from typing import Any
 from django.core.management.base import BaseCommand
 from django.db import transaction
+from django.conf import settings
 
 from dataset.models import Dictionary, DictionaryKind, DictionaryValue
 
 
-NAME_SET = "Procesu zapraszania Szok"
-CODE_SET = "aiinvite"
-DESC_SET = "Etykietowanie Maili dla procesu zapraszania Szok."
+NAME_SET = settings.DICTIONARY_NAME_SET
+CODE_SET = settings.DICTIONARY_CODE_SET
+DEFAULT_PREPROCESS_VERSION = settings.DEFAULT_PREPROCESS_VERSION
+DEFAULT_PREPROCESS_LOCALE = settings.DEFAULT_PREPROCESS_LOCALE
+DESC_SET = settings.DICTIONARY_DESC_SET
 
 
 class Command(BaseCommand):
@@ -22,8 +25,8 @@ class Command(BaseCommand):
         # 1) Dictionary (zestaw)
         dictionary, _ = Dictionary.objects.get_or_create(
             code=CODE_SET,
-            version="v1",
-            locale="pl",
+            version=DEFAULT_PREPROCESS_VERSION,
+            locale=DEFAULT_PREPROCESS_LOCALE,
             defaults={
                 "name": NAME_SET,
                 "description": DESC_SET,

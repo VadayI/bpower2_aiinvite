@@ -1,4 +1,5 @@
 import logging
+from typing import Optional
 
 from django.conf import settings
 from django.db.models import (
@@ -25,7 +26,7 @@ from dataset.chatgpt_client import (
 )
 
 from dataset.models import Dictionary, DictionaryKind, DictionaryValue, DatasetSample, \
-    Annotation, LabelFinal, ModelPrediction
+    Annotation, LabelFinal, ModelPrediction, _normalize_content, _sha256
 from .serializers import PersonSerializer, EmailMessageSerializer, ThreadSerializer
 
 logging.basicConfig(level=logging.INFO)
@@ -39,7 +40,10 @@ OPENAI_API_KEY = settings.OPENAI_API_KEY
 MAX_CHARS_THREAD = settings.MAX_CHARS_THREAD
 THREAD_MSG_SEPARATOR = "\n\n---\n\n"
 
-
+DICTIONARY_NAME_SET = settings.DICTIONARY_NAME_SET
+DICTIONARY_CODE_SET = settings.DICTIONARY_CODE_SET
+DEFAULT_PREPROCESS_VERSION = settings.DEFAULT_PREPROCESS_VERSION
+DEFAULT_PREPROCESS_LOCALE = settings.DEFAULT_PREPROCESS_LOCALE
 
 # --------------- Auth -------------------------------------------------------
 
@@ -1064,3 +1068,138 @@ class LabelPreviewThreadView(_LabelPreviewBase):
         all_rows = new_rows + cached_rows
 
         return Response({"labels": self._sort_rows(all_rows, kinds_qs), "cached": False}, status=200)
+
+
+# ---------------------- Pobranie zapisanych Etykiet OpenAI ------------------
+
+class LatestModelPredsForEmailView(APIView):
+    """
+    GET /api/label/latest?message_id=123&dictionary_code=aiinvite&version=v1&locale=pl
+    """
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request, *args, **kwargs):
+        try:
+            message_id = int(request.query_params.get("message_id"))
+        except (TypeError, ValueError):
+            return Response({"detail": "Podaj poprawny message_id."}, status=400)
+
+        dictionary = None
+        code = request.query_params.get("dictionary_code", DICTIONARY_CODE_SET)
+        version = request.query_params.get("version", DEFAULT_PREPROCESS_VERSION)
+        locale = request.query_params.get("locale", DEFAULT_PREPROCESS_LOCALE)
+        if code:
+            q = Dictionary.objects.filter(code=code)
+            if version:
+                q = q.filter(version=version)
+            if locale:
+                q = q.filter(locale=locale)
+            dictionary = q.order_by("-is_active").first()
+
+        # wybierz jedną wersję helpera:
+        rows = get_latest_openai_preds_for_email_postgres(message_id, dictionary=dictionary)
+        # lub: rows = get_latest_openai_preds_for_email_portable(message_id, dictionary=dictionary)
+
+        return Response({"message_id": message_id, "labels": rows}, status=200)
+    
+
+def _resolve_sample_for_email(message_id: int) -> Optional[DatasetSample]:
+    """
+    Znajdź (lub odtwórz) klucz próbki dla danego maila na podstawie treści i normalizacji.
+    Nie tworzymy nowej próbki – tylko wyszukujemy po hash+version+source.
+    """
+    try:
+        msg = EmailMessage.objects.only("id", "subject", "text_processed").get(pk=message_id)
+    except EmailMessage.DoesNotExist:
+        return None
+
+    email_text = (msg.text_processed or "") or (msg.subject or "")
+    norm = _normalize_content(email_text)
+    if not norm:
+        return None
+
+    h = _sha256(norm)
+    return DatasetSample.objects.filter(
+        content_hash=h,
+        preprocess_version=DEFAULT_PREPROCESS_VERSION,
+        source="email",
+    ).order_by("-created_at", "-id").first()
+
+
+def get_latest_openai_preds_for_email_postgres(
+    message_id: int,
+    *,
+    dictionary: Optional[Dictionary] = None,
+) -> list[dict]:
+    """
+    Wersja zoptymalizowana dla PostgreSQL: DISTINCT ON (kind_id).
+    Zwraca: listę słowników {kind_id, kind_code, value_id, value_code, snippet, proba, created_at}
+    """
+    sample = _resolve_sample_for_email(message_id)
+    if not sample:
+        return []
+
+    qs = ModelPrediction.objects.filter(
+        sample=sample,
+        model_name=OPENAI_MODEL_NAME,
+        model_version=OPENAI_MODEL_VERSION,
+    ).select_related("kind", "value")
+
+    if hasattr(ModelPrediction, "dictionary_id") and dictionary is not None:
+        qs = qs.filter(dictionary=dictionary)
+
+    # najnowszy per kind
+    qs = qs.order_by("kind_id", "-created_at", "-id").distinct("kind_id")
+
+    return [
+        {
+            "kind_id": p.kind_id,
+            "kind_code": p.kind.code,
+            "value_id": p.value_id,
+            "value_code": p.value.code,
+            "snippet": p.evidence_snippet or "",
+            "proba": p.proba,
+            "created_at": p.created_at,
+        }
+        for p in qs
+    ]
+
+
+def get_latest_openai_preds_for_email_portable(
+    message_id: int,
+    *,
+    dictionary: Optional[Dictionary] = None,
+) -> list[dict]:
+    """
+    Wersja przenośna (bez DISTINCT ON): deduplikacja w Pythonie.
+    """
+    sample = _resolve_sample_for_email(message_id)
+    if not sample:
+        return []
+
+    qs = ModelPrediction.objects.filter(
+        sample=sample,
+        model_name=OPENAI_MODEL_NAME,
+        model_version=OPENAI_MODEL_VERSION,
+    ).select_related("kind", "value").order_by("kind_id", "-created_at", "-id")
+
+    if hasattr(ModelPrediction, "dictionary_id") and dictionary is not None:
+        qs = qs.filter(dictionary=dictionary)
+
+    seen = set()
+    out = []
+    for p in qs:
+        if p.kind_id in seen:
+            continue
+        seen.add(p.kind_id)
+        out.append({
+            "kind_id": p.kind_id,
+            "kind_code": p.kind.code,
+            "value_id": p.value_id,
+            "value_code": p.value.code,
+            "snippet": p.evidence_snippet or "",
+            "proba": p.proba,
+            "created_at": p.created_at,
+        })
+    return out
+
