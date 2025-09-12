@@ -290,7 +290,7 @@ class MessageViewSet(viewsets.ReadOnlyModelViewSet):
             qs = qs.filter(thread_id=thread_id)
 
         return qs.select_related("from_person", "delivered_to", "thread") \
-                 .order_by("-received_at", "-sent_at", "-id")
+                 .order_by("received_at", "sent_at", "id")
 
     # ------- AKCJE ZMIENIAJĄCE POLE 'useless' -------
 
