@@ -8,8 +8,9 @@ from .views import (
     DictionaryValueViewSet,
     LabelViewSet,
     TokenAuthView,
-    LabelPreviewView,
-    ThreadViewSet
+    ThreadViewSet,
+    LabelPreviewMessageView,
+    LabelPreviewThreadView
 )
 
 router = DefaultRouter()
@@ -26,5 +27,6 @@ urlpatterns = [
     path("token-auth/", TokenAuthView.as_view(), name="token-auth"),  # <-- /api/token-auth/
     path("", include(router.urls)),                                   # Pozostałe endpointy
     path("api-auth/", include("rest_framework.urls")),                # sesyjne logowanie /api-auth/login/
-    path("label/preview", LabelPreviewView.as_view(), name="label-preview"),
+    path("label/preview/message", LabelPreviewMessageView.as_view(), name="label-preview-message"),
+    path("label/preview/thread", LabelPreviewThreadView.as_view(), name="label-preview-thread"),
 ]

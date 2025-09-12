@@ -1,4 +1,5 @@
 import logging
+from __future__ import annotations
 
 from django.conf import settings
 from django.db.models import (
@@ -6,6 +7,7 @@ from django.db.models import (
 )
 from django.db import transaction
 from django.db.models.functions import Coalesce
+from django.db.models import QuerySet
 
 from rest_framework import viewsets, mixins, status, permissions
 from rest_framework.decorators import action
@@ -24,9 +26,8 @@ from dataset.chatgpt_client import (
 )
 
 from dataset.models import Dictionary, DictionaryKind, DictionaryValue, DatasetSample, \
-    Annotation, LabelFinal, DictionaryKind, DictionaryValue, ModelPrediction
-from .serializers import PersonSerializer, EmailMessageSerializer, ThreadSerializer, \
-    ThreadSerializer
+    Annotation, LabelFinal, ModelPrediction
+from .serializers import PersonSerializer, EmailMessageSerializer, ThreadSerializer
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -35,6 +36,10 @@ OPENAI_MODEL_NAME = settings.OPENAI_MODEL_NAME
 OPENAI_MODEL_VERSION = settings.OPENAI_MODEL_VERSION
 DEFAULT_PREPROCESS_VERSION = settings.DEFAULT_PREPROCESS_VERSION
 OPENAI_API_KEY = settings.OPENAI_API_KEY
+
+MAX_CHARS_THREAD = settings.MAX_CHARS_THREAD
+THREAD_MSG_SEPARATOR = "\n\n---\n\n"
+
 
 
 # --------------- Auth -------------------------------------------------------
@@ -218,10 +223,33 @@ class MessageViewSet(viewsets.ReadOnlyModelViewSet):
         [&only_user_processed=true|false]  (domyślnie false)
         [&with_user_processed=true|false]  (domyślnie true)
         [&kinds=TO|TO,CC,BCC]              (domyślnie TO – tak jak w sync_partner_stats.py)
+        Jeśli all=true → zwracamy wszystkie elementy w jednej odpowiedzi (bez paginacji).
     """
     serializer_class = EmailMessageSerializer
     pagination_class = SmallPage
     permission_classes = [permissions.IsAuthenticated]
+
+    def paginate_queryset(self, queryset):
+        """
+        Obsługa parametru all=true → wyłącza paginację.
+        """
+        all_param = self.request.query_params.get("all")
+        if all_param and all_param.lower() in ("1", "true", "yes"):
+            return None  # brak paginacji, przechodzi do get_paginated_response bez użycia paginatora
+        return super().paginate_queryset(queryset)
+
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+
+        # brak paginacji – zwracamy wszystkie
+        serializer = self.get_serializer(queryset, many=True)
+        return Response(serializer.data)
+
 
     def get_queryset(self):
         params = self.request.query_params
@@ -687,193 +715,12 @@ class LabelViewSet(mixins.CreateModelMixin,
     
 # ---------------------- Etykietowanie OpenAI (dynamicznie) ------------------
 
-class LabelPreviewView(APIView):
-    """
-    POST /api/label/preview
-    Body:
-    {
-      "message_id": 123,
-      "kinds": ["emotion","style","relation"],   # opcjonalnie: lista kodów lub ID
-      "dictionary_code": "aiinvite",             # opcjonalnie (domyślnie: aiinvite)
-      "dictionary_version": "v1",                # opcjonalnie
-      "dictionary_locale": "pl"                  # opcjonalnie
-    }
+# ============ Klasa bazowa ze wspólnymi helperami ============
 
-    Zwraca:
-    {
-      "labels": [
-        {"kind_code":"emotion","kind_id":7,"value_code":"joy","value_id":42,"snippet":"..."},
-        ...
-      ],
-      "cached": true|false
-    }
-    """
+class _LabelPreviewBase(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
-    @transaction.atomic
-    def post(self, request, *args, **kwargs):
-        message_id = request.data.get("message_id")
-        if not message_id:
-            return Response({"detail": "Brak message_id."}, status=400)
-
-        # --- 1) Wiadomość i tekst ---
-        try:
-            msg = (
-                EmailMessage.objects
-                .only("id","subject","direction","text_processed")
-                .get(pk=message_id)
-            )
-        except EmailMessage.DoesNotExist:
-            return Response({"detail": "EmailMessage not found."}, status=404)
-
-        email_text = (msg.text_processed or "") or (msg.subject or "")
-        if not email_text.strip():
-            return Response({"detail": "Brak treści/tematu do klasyfikacji."}, status=400)
-
-        # --- 2) Rodzaje (kinds) ---
-        input_kinds = request.data.get("kinds") or []
-        kinds_qs = self._resolve_kinds(input_kinds)
-        if not kinds_qs.exists():
-            return Response({"detail": "Brak zdefiniowanych rodzajów (kinds)."}, status=400)
-
-        kinds_by_id = {k.id: k for k in kinds_qs}
-
-        # --- 3) Zestaw słowników (code/version/locale) ---
-        dictionary_code = request.data.get("dictionary_code") or "aiinvite"
-        dictionary_version = request.data.get("dictionary_version") or "v1"
-        dictionary_locale = request.data.get("dictionary_locale") or "pl"
-
-        # --- 3a) Próbka datasetowa (NIE powiązana FK z ingestion) ---
-        # deduplikacja po (content_hash, preprocess_version, source)
-        sample, _created = DatasetSample.objects.get_or_create_from_text(
-            email_text,
-            preprocess_version=DEFAULT_PREPROCESS_VERSION,
-            lang="pl",
-            source="email",  # <--- kluczowe: dataset niezależny; tylko metadana 'source'
-        )
-
-        # --- 4) Sprawdź cache (ModelPrediction) ---
-        preds_qs = (
-            ModelPrediction.objects
-            .filter(
-                sample=sample,
-                kind_id__in=list(kinds_by_id.keys()),
-                model_name=OPENAI_MODEL_NAME,
-                model_version=OPENAI_MODEL_VERSION,
-            )
-            .select_related("kind","value")
-        )
-
-        # Jeśli masz pole 'dictionary' w ModelPrediction: filtruj pod konkretny zestaw
-        dictionary = self._find_dictionary(dictionary_code, dictionary_version, dictionary_locale)
-        if hasattr(ModelPrediction, "dictionary_id") and dictionary is not None:
-            preds_qs = preds_qs.filter(dictionary=dictionary)
-
-        preds_by_kind_id = {p.kind_id: p for p in preds_qs}
-        need_kind_ids = [kid for kid in kinds_by_id.keys() if kid not in preds_by_kind_id]
-        cached_fully = len(need_kind_ids) == 0
-
-        result_rows = []
-
-        if cached_fully:
-            for p in preds_qs:
-                result_rows.append({
-                    "kind_id": p.kind_id,
-                    "kind_code": p.kind.code,
-                    "value_id": p.value_id,
-                    "value_code": p.value.code,
-                    "snippet": p.evidence_snippet or "",
-                })
-            return Response({"labels": self._sort_rows(result_rows, kinds_qs), "cached": True}, status=200)
-
-        # --- 5) Braki -> wołamy OpenAI (1 call) ---
-        try:
-            raw_args, enums = label_email_with_openai(
-                email_text=email_text,
-                model_openai=OPENAI_MODEL_VERSION,
-                openai_api_key=OPENAI_API_KEY,
-                subject=(msg.subject or None),
-                direction=msg.direction,
-                dictionary_code=dictionary_code,
-                dictionary_version=dictionary_version,
-                dictionary_locale=dictionary_locale,
-            )
-            rows = to_label_rows(raw_args, enums)  # [{"kind_id","value_id","snippet"}...]
-            dictionary_id = enums.get("dictionary_id")  # może być None
-        except ValueError as e:
-            return Response({"detail": str(e)}, status=422)
-        except Exception as e:
-            logger.exception("OpenAI error")
-            return Response({"detail": f"OpenAI error: {e}"}, status=502)
-
-        # mapy pomocnicze
-        values_map = self._build_values_map(kinds_qs, dictionary_id)
-
-        saved_any = False
-
-        for r in rows:
-            r_kind_id = r.get("kind_id")
-            r_value_id = r.get("value_id")
-            snippet = (r.get("snippet") or "").strip()
-
-            # jeżeli to_label_rows zwraca kind_id/value_id już lokalne – OK,
-            # ale upewnijmy się, że to rodzaj z 'need_kind_ids'
-            if r_kind_id not in need_kind_ids:
-                continue
-
-            # safety: jeżeli value_id brak – spróbuj zmapować po kodzie
-            if not r_value_id and r.get("value_code"):
-                local_map = values_map.get(r_kind_id, {})
-                r_value_id = local_map.get(r["value_code"])
-                if not r_value_id:
-                    logger.warning("Brak mapy value_id dla kind_id=%s value_code=%r", r_kind_id, r.get("value_code"))
-                    continue
-
-            defaults = {
-                "value_id": r_value_id,
-                "proba": float(r.get("proba", 0.0)) if r.get("proba") is not None else 0.0,
-                "evidence_snippet": snippet,  # <-- zapisujemy dowód
-            }
-            # jeżeli mamy pole 'dictionary' – dołóżmy je do upsertu
-            if hasattr(ModelPrediction, "dictionary_id") and dictionary_id:
-                defaults["dictionary_id"] = dictionary_id
-
-            pred, created_pred = ModelPrediction.objects.update_or_create(
-                sample=sample,
-                kind_id=r_kind_id,
-                model_name=OPENAI_MODEL_NAME,
-                model_version=OPENAI_MODEL_VERSION,
-                # jeżeli masz kolumnę 'dictionary', dorzuć też ją do klucza wyszukiwania:
-                **({"defaults": defaults} if not hasattr(ModelPrediction, "dictionary_id") else {}),
-                **({} if not hasattr(ModelPrediction, "dictionary_id") else {
-                    "dictionary_id": dictionary_id,
-                    "defaults": defaults
-                }),
-            )
-            saved_any = saved_any or created_pred
-
-            result_rows.append({
-                "kind_id": pred.kind_id,
-                "kind_code": kinds_by_id[pred.kind_id].code,
-                "value_id": pred.value_id,
-                "value_code": pred.value.code,
-                "snippet": pred.evidence_snippet or "",
-            })
-
-        # dołącz zcache’owane (żeby zwrócić komplet)
-        for kid, pred in preds_by_kind_id.items():
-            result_rows.append({
-                "kind_id": pred.kind_id,
-                "kind_code": pred.kind.code,
-                "value_id": pred.value_id,
-                "value_code": pred.value.code,
-                "snippet": pred.evidence_snippet or "",
-            })
-
-        return Response({"labels": self._sort_rows(result_rows, kinds_qs), "cached": not saved_any}, status=200)
-
-    # -------------- helpers --------------
-
+    # ---- helpers (wspólne) ----
     def _resolve_kinds(self, input_kinds):
         qs = DictionaryKind.objects.all()
         if not input_kinds:
@@ -909,3 +756,310 @@ class LabelPreviewView(APIView):
         if locale:
             qs = qs.filter(locale=locale)
         return qs.order_by("-is_active").first()
+
+    def _serialize_cached_preds(self, preds_qs: QuerySet[ModelPrediction]):
+        rows = []
+        for p in preds_qs.select_related("kind", "value"):
+            rows.append({
+                "kind_id": p.kind_id,
+                "kind_code": p.kind.code,
+                "value_id": p.value_id,
+                "value_code": p.value.code,
+                "snippet": p.evidence_snippet or "",
+            })
+        return rows
+
+    def _upsert_missing_preds(
+        self,
+        *,
+        email_text: str,
+        subject: str | None,
+        direction: str | None,
+        kinds_qs: QuerySet[DictionaryKind],
+        need_kind_ids: list[int],
+        kinds_by_id: dict[int, DictionaryKind],
+        dictionary_code: str,
+        dictionary_version: str,
+        dictionary_locale: str,
+        sample: DatasetSample,
+        dictionary: Dictionary | None
+    ):
+        """
+        Wykonuje pojedyncze wywołanie OpenAI i zapisuje brakujące predykcje (ModelPrediction).
+        Zwraca: (result_rows, any_saved: bool)
+        """
+        # 1) LLM
+        try:
+            raw_args, enums = label_email_with_openai(
+                email_text=email_text,
+                subject=subject,
+                direction=direction,
+                dictionary_code=dictionary_code,
+                dictionary_version=dictionary_version,
+                dictionary_locale=dictionary_locale,
+            )
+            rows = to_label_rows(raw_args, enums)  # [{"kind_id","value_id","snippet"}...]
+            dictionary_id = enums.get("dictionary_id")  # może być None
+        except Exception as e:
+            logger.exception("OpenAI error")
+            # Zwróć 502, ale zostaw obsługę wyjątku wyżej (w callerze)
+            raise
+
+        values_map = self._build_values_map(kinds_qs, dictionary_id)
+        need_kind_ids_set = set(need_kind_ids)
+
+        result_rows = []
+        saved_any = False
+
+        for r in rows:
+            r_kind_id = r.get("kind_id")
+            r_value_id = r.get("value_id")
+            snippet = (r.get("snippet") or "").strip()
+
+            if r_kind_id not in need_kind_ids_set:
+                continue
+
+            if not r_value_id and r.get("value_code"):
+                local_map = values_map.get(r_kind_id, {})
+                r_value_id = local_map.get(r["value_code"])
+                if not r_value_id:
+                    logger.warning("Brak mapy value_id dla kind_id=%s value_code=%r", r_kind_id, r.get("value_code"))
+                    continue
+
+            defaults = {
+                "value_id": r_value_id,
+                "proba": float(r.get("proba", 0.0)) if r.get("proba") is not None else 0.0,
+                "evidence_snippet": snippet,
+            }
+            pred_kwargs = dict(
+                sample=sample,
+                kind_id=r_kind_id,
+                model_name=OPENAI_MODEL_NAME,
+                model_version=OPENAI_MODEL_VERSION,
+            )
+            if hasattr(ModelPrediction, "dictionary_id") and dictionary_id:
+                pred_kwargs["dictionary_id"] = dictionary_id
+
+            pred, created_pred = ModelPrediction.objects.update_or_create(
+                **pred_kwargs, defaults=defaults
+            )
+            saved_any = saved_any or created_pred
+
+            result_rows.append({
+                "kind_id": pred.kind_id,
+                "kind_code": kinds_by_id[pred.kind_id].code,
+                "value_id": pred.value_id,
+                "value_code": pred.value.code,
+                "snippet": pred.evidence_snippet or "",
+            })
+
+        return result_rows, saved_any
+
+
+# ============ 1) Pojedyncza wiadomość ============
+
+class LabelPreviewMessageView(_LabelPreviewBase):
+    """
+    POST /api/label/preview/message
+    Body:
+    {
+      "message_id": 123,
+      "kinds": ["emotion","style","relation"],   # opcjonalnie
+      "dictionary_code": "aiinvite",             # opcjonalnie (domyślnie: aiinvite)
+      "dictionary_version": "v1",                # opcjonalnie
+      "dictionary_locale": "pl"                  # opcjonalnie
+    }
+    """
+
+    @transaction.atomic
+    def post(self, request, *args, **kwargs):
+        message_id = request.data.get("message_id")
+        if not message_id:
+            return Response({"detail": "Brak message_id."}, status=400)
+
+        try:
+            msg = (
+                EmailMessage.objects
+                .only("id","subject","direction","text_processed")
+                .get(pk=message_id)
+            )
+        except EmailMessage.DoesNotExist:
+            return Response({"detail": "EmailMessage not found."}, status=404)
+
+        email_text = (msg.text_processed or "") or (msg.subject or "")
+        if not email_text.strip():
+            return Response({"detail": "Brak treści/tematu do klasyfikacji."}, status=400)
+
+        # kinds
+        kinds_qs = self._resolve_kinds(request.data.get("kinds") or [])
+        if not kinds_qs.exists():
+            return Response({"detail": "Brak zdefiniowanych rodzajów (kinds)."}, status=400)
+        kinds_by_id = {k.id: k for k in kinds_qs}
+
+        # dictionary
+        dictionary_code = request.data.get("dictionary_code") or "aiinvite"
+        dictionary_version = request.data.get("dictionary_version") or "v1"
+        dictionary_locale = request.data.get("dictionary_locale") or "pl"
+        dictionary = self._find_dictionary(dictionary_code, dictionary_version, dictionary_locale)
+
+        # DatasetSample (email)
+        sample, _ = DatasetSample.objects.get_or_create_from_text(
+            email_text,
+            preprocess_version=DEFAULT_PREPROCESS_VERSION,
+            lang="pl",
+            source="email",
+        )
+
+        # cache
+        preds_qs = ModelPrediction.objects.filter(
+            sample=sample,
+            kind_id__in=list(kinds_by_id.keys()),
+            model_name=OPENAI_MODEL_NAME,
+            model_version=OPENAI_MODEL_VERSION,
+        ).select_related("kind","value")
+
+        if hasattr(ModelPrediction, "dictionary_id") and dictionary is not None:
+            preds_qs = preds_qs.filter(dictionary=dictionary)
+
+        preds_by_kind_id = {p.kind_id: p for p in preds_qs}
+        need_kind_ids = [kid for kid in kinds_by_id.keys() if kid not in preds_by_kind_id]
+        if not need_kind_ids:
+            rows = self._serialize_cached_preds(preds_qs)
+            return Response({"labels": self._sort_rows(rows, kinds_qs), "cached": True}, status=200)
+
+        # missing -> OpenAI
+        try:
+            new_rows, saved_any = self._upsert_missing_preds(
+                email_text=email_text,
+                subject=(msg.subject or None),
+                direction=msg.direction,
+                kinds_qs=kinds_qs,
+                need_kind_ids=need_kind_ids,
+                kinds_by_id=kinds_by_id,
+                dictionary_code=dictionary_code,
+                dictionary_version=dictionary_version,
+                dictionary_locale=dictionary_locale,
+                sample=sample,
+                dictionary=dictionary,
+            )
+        except Exception as e:
+            return Response({"detail": f"OpenAI error: {e}"}, status=502)
+
+        # dołącz to, co było w cache
+        cached_rows = self._serialize_cached_preds(preds_qs)
+        all_rows = new_rows + cached_rows
+
+        return Response({"labels": self._sort_rows(all_rows, kinds_qs), "cached": False}, status=200)
+
+
+# ============ 2) Cały wątek ============
+
+class LabelPreviewThreadView(_LabelPreviewBase):
+    """
+    POST /api/label/preview/thread
+    Body:
+    {
+      "thread_id": 456,
+      "kinds": ["emotion","style","relation"],   # opcjonalnie
+      "dictionary_code": "aiinvite",             # opcjonalnie (domyślnie: aiinvite)
+      "dictionary_version": "v1",                # opcjonalnie
+      "dictionary_locale": "pl"                  # opcjonalnie
+    }
+    """
+
+    @transaction.atomic
+    def post(self, request, *args, **kwargs):
+        thread_id = request.data.get("thread_id")
+        if not thread_id:
+            return Response({"detail": "Brak thread_id."}, status=400)
+
+        try:
+            thread = Thread.objects.get(pk=thread_id)
+        except Thread.DoesNotExist:
+            return Response({"detail": "Thread not found."}, status=404)
+
+        # Zbuduj tekst całego wątku (kolejność po czasie; fallback po id)
+        msgs = (
+            EmailMessage.objects
+            .filter(thread=thread)
+            .only("id", "subject", "direction", "text_processed", "sent_at", "received_at")
+            .order_by("sent_at", "received_at", "id")
+        )
+
+        if not msgs.exists():
+            return Response({"detail": "Wątek nie zawiera wiadomości."}, status=400)
+
+        parts: list[str] = []
+        for m in msgs:
+            header = f"[{m.direction.upper()}] {m.subject or ''}".strip()
+            body = (m.text_processed or "") or (m.subject or "")
+            parts.append((header + "\n" + body).strip())
+
+        thread_text = THREAD_MSG_SEPARATOR.join(parts)
+        if len(thread_text) > MAX_CHARS_THREAD:
+            thread_text = thread_text[-MAX_CHARS_THREAD:]  # przycinamy od końca (nowsza część dialogu)
+
+        if not thread_text.strip():
+            return Response({"detail": "Brak treści wątku do klasyfikacji."}, status=400)
+
+        # kinds
+        kinds_qs = self._resolve_kinds(request.data.get("kinds") or [])
+        if not kinds_qs.exists():
+            return Response({"detail": "Brak zdefiniowanych rodzajów (kinds)."}, status=400)
+        kinds_by_id = {k.id: k for k in kinds_qs}
+
+        # dictionary
+        dictionary_code = request.data.get("dictionary_code") or "aiinvite"
+        dictionary_version = request.data.get("dictionary_version") or "v1"
+        dictionary_locale = request.data.get("dictionary_locale") or "pl"
+        dictionary = self._find_dictionary(dictionary_code, dictionary_version, dictionary_locale)
+
+        # DatasetSample (thread)
+        sample, _ = DatasetSample.objects.get_or_create_from_text(
+            thread_text,
+            preprocess_version=DEFAULT_PREPROCESS_VERSION,
+            lang="pl",
+            source="thread",
+        )
+
+        # cache
+        preds_qs = ModelPrediction.objects.filter(
+            sample=sample,
+            kind_id__in=list(kinds_by_id.keys()),
+            model_name=OPENAI_MODEL_NAME,
+            model_version=OPENAI_MODEL_VERSION,
+        ).select_related("kind","value")
+
+        if hasattr(ModelPrediction, "dictionary_id") and dictionary is not None:
+            preds_qs = preds_qs.filter(dictionary=dictionary)
+
+        preds_by_kind_id = {p.kind_id: p for p in preds_qs}
+        need_kind_ids = [kid for kid in kinds_by_id.keys() if kid not in preds_by_kind_id]
+        if not need_kind_ids:
+            rows = self._serialize_cached_preds(preds_qs)
+            return Response({"labels": self._sort_rows(rows, kinds_qs), "cached": True}, status=200)
+
+        # missing -> OpenAI
+        # W wątku nie ma jednego subjecta/direction, więc przekażemy None (LLM widzi kontekst w tekście)
+        try:
+            new_rows, saved_any = self._upsert_missing_preds(
+                email_text=thread_text,
+                subject=None,
+                direction=None,
+                kinds_qs=kinds_qs,
+                need_kind_ids=need_kind_ids,
+                kinds_by_id=kinds_by_id,
+                dictionary_code=dictionary_code,
+                dictionary_version=dictionary_version,
+                dictionary_locale=dictionary_locale,
+                sample=sample,
+                dictionary=dictionary,
+            )
+        except Exception as e:
+            return Response({"detail": f"OpenAI error: {e}"}, status=502)
+
+        # dołącz cache
+        cached_rows = self._serialize_cached_preds(preds_qs)
+        all_rows = new_rows + cached_rows
+
+        return Response({"labels": self._sort_rows(all_rows, kinds_qs), "cached": False}, status=200)

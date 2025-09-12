@@ -22,6 +22,7 @@ OPENAI_MODEL_NAME = env('OPENAI_MODEL_NAME', default='')
 OPENAI_MODEL_VERSION = env('OPENAI_MODEL_VERSION', default='')
 DEFAULT_PREPROCESS_VERSION = env('DEFAULT_PREPROCESS_VERSION', default='')
 OPENAI_API_KEY = env('OPENAI_API_KEY', default='')
+MAX_CHARS_THREAD = env('MAX_CHARS_THREAD', default='')
 
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
