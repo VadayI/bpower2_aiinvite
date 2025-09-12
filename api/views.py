@@ -791,6 +791,8 @@ class _LabelPreviewBase(APIView):
         try:
             raw_args, enums = label_email_with_openai(
                 email_text=email_text,
+                model_openai=OPENAI_MODEL_VERSION,
+                openai_api_key=OPENAI_API_KEY,
                 subject=subject,
                 direction=direction,
                 dictionary_code=dictionary_code,
