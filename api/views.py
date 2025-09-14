@@ -1,5 +1,7 @@
 import logging
 from typing import Optional
+import re 
+import hashlib
 
 from django.conf import settings
 from django.db.models import (
@@ -37,12 +39,11 @@ OPENAI_MODEL_VERSION = settings.OPENAI_MODEL_VERSION
 DEFAULT_PREPROCESS_VERSION = settings.DEFAULT_PREPROCESS_VERSION
 OPENAI_API_KEY = settings.OPENAI_API_KEY
 
-MAX_CHARS_THREAD = settings.MAX_CHARS_THREAD
+MAX_CHARS_THREAD = int(settings.MAX_CHARS_THREAD)
 THREAD_MSG_SEPARATOR = "\n\n---\n\n"
 
 DICTIONARY_NAME_SET = settings.DICTIONARY_NAME_SET
 DICTIONARY_CODE_SET = settings.DICTIONARY_CODE_SET
-DEFAULT_PREPROCESS_VERSION = settings.DEFAULT_PREPROCESS_VERSION
 DEFAULT_PREPROCESS_LOCALE = settings.DEFAULT_PREPROCESS_LOCALE
 
 # --------------- Auth -------------------------------------------------------
@@ -1014,9 +1015,9 @@ class LabelPreviewThreadView(_LabelPreviewBase):
         kinds_by_id = {k.id: k for k in kinds_qs}
 
         # dictionary
-        dictionary_code = request.data.get("dictionary_code") or "aiinvite"
-        dictionary_version = request.data.get("dictionary_version") or "v1"
-        dictionary_locale = request.data.get("dictionary_locale") or "pl"
+        dictionary_code = request.data.get("dictionary_code") or DICTIONARY_CODE_SET
+        dictionary_version = request.data.get("dictionary_version") or OPENAI_MODEL_VERSION
+        dictionary_locale = request.data.get("dictionary_locale") or DEFAULT_PREPROCESS_LOCALE
         dictionary = self._find_dictionary(dictionary_code, dictionary_version, dictionary_locale)
 
         # DatasetSample (thread)
@@ -1072,41 +1073,34 @@ class LabelPreviewThreadView(_LabelPreviewBase):
 
 # ---------------------- Pobranie zapisanych Etykiet OpenAI ------------------
 
-class LatestModelPredsForEmailView(APIView):
-    """
-    GET /api/label/latest?message_id=123&dictionary_code=aiinvite&version=v1&locale=pl
-    """
-    permission_classes = [permissions.IsAuthenticated]
+# --- te same utilsy co w dataset.models ---
+def _normalize_content(text: str) -> str:
+    if text is None:
+        return ""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t\f\v]+", " ", text)
+    return text.strip()
 
-    def get(self, request, *args, **kwargs):
-        try:
-            message_id = int(request.query_params.get("message_id"))
-        except (TypeError, ValueError):
-            return Response({"detail": "Podaj poprawny message_id."}, status=400)
 
-        dictionary = None
-        code = request.query_params.get("dictionary_code", DICTIONARY_CODE_SET)
-        version = request.query_params.get("version", DEFAULT_PREPROCESS_VERSION)
-        locale = request.query_params.get("locale", DEFAULT_PREPROCESS_LOCALE)
-        if code:
-            q = Dictionary.objects.filter(code=code)
-            if version:
-                q = q.filter(version=version)
-            if locale:
-                q = q.filter(locale=locale)
-            dictionary = q.order_by("-is_active").first()
+def _sha256(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
-        # wybierz jedną wersję helpera:
-        rows = get_latest_openai_preds_for_email_postgres(message_id, dictionary=dictionary)
-        # lub: rows = get_latest_openai_preds_for_email_portable(message_id, dictionary=dictionary)
 
-        return Response({"message_id": message_id, "labels": rows}, status=200)
-    
+def _resolve_dictionary(code: Optional[str], version: Optional[str], locale: Optional[str]) -> Optional[Dictionary]:
+    if not code:
+        return None
+    qs = Dictionary.objects.filter(code=code)
+    if version:
+        qs = qs.filter(version=version)
+    if locale:
+        qs = qs.filter(locale=locale)
+    return qs.order_by("-is_active").first()
+
 
 def _resolve_sample_for_email(message_id: int) -> Optional[DatasetSample]:
     """
-    Znajdź (lub odtwórz) klucz próbki dla danego maila na podstawie treści i normalizacji.
-    Nie tworzymy nowej próbki – tylko wyszukujemy po hash+version+source.
+    Znajdź próbkę odpowiadającą pojedynczemu e-mailowi
+    (po hash+preprocess_version+source='email').
     """
     try:
         msg = EmailMessage.objects.only("id", "subject", "text_processed").get(pk=message_id)
@@ -1119,36 +1113,72 @@ def _resolve_sample_for_email(message_id: int) -> Optional[DatasetSample]:
         return None
 
     h = _sha256(norm)
-    return DatasetSample.objects.filter(
-        content_hash=h,
-        preprocess_version=DEFAULT_PREPROCESS_VERSION,
-        source="email",
-    ).order_by("-created_at", "-id").first()
+    return (
+        DatasetSample.objects
+        .filter(content_hash=h, preprocess_version=DEFAULT_PREPROCESS_VERSION, source="email")
+        .order_by("-created_at", "-id")
+        .first()
+    )
 
 
-def get_latest_openai_preds_for_email_postgres(
-    message_id: int,
-    *,
-    dictionary: Optional[Dictionary] = None,
-) -> list[dict]:
+def _resolve_sample_for_thread(thread_id: int) -> Optional[DatasetSample]:
     """
-    Wersja zoptymalizowana dla PostgreSQL: DISTINCT ON (kind_id).
-    Zwraca: listę słowników {kind_id, kind_code, value_id, value_code, snippet, proba, created_at}
+    Odtwórz treść WĄTKU w dokładnie taki sam sposób jak przy etykietowaniu:
+    - sort: sent_at, received_at, id
+    - separator: THREAD_MSG_SEPARATOR
+    - przycięcie do MAX_CHARS_THREAD (od końca)
+    Następnie znajdź próbkę po hash+preprocess_version+source='thread'.
     """
-    sample = _resolve_sample_for_email(message_id)
-    if not sample:
-        return []
+    try:
+        thread = Thread.objects.get(pk=thread_id)
+    except Thread.DoesNotExist:
+        return None
 
-    qs = ModelPrediction.objects.filter(
-        sample=sample,
-        model_name=OPENAI_MODEL_NAME,
-        model_version=OPENAI_MODEL_VERSION,
-    ).select_related("kind", "value")
+    msgs = (
+        EmailMessage.objects
+        .filter(thread=thread)
+        .only("id", "subject", "direction", "text_processed", "sent_at", "received_at")
+        .order_by("sent_at", "received_at", "id")
+    )
+    if not msgs.exists():
+        return None
 
+    parts = []
+    for m in msgs:
+        header = f"[{m.direction.upper()}] {m.subject or ''}".strip()
+        body = (m.text_processed or "") or (m.subject or "")
+        parts.append((header + "\n" + body).strip())
+
+    thread_text = THREAD_MSG_SEPARATOR.join(parts)
+    if len(thread_text) > MAX_CHARS_THREAD:
+        thread_text = thread_text[-MAX_CHARS_THREAD:]
+
+    norm = _normalize_content(thread_text)
+    if not norm:
+        return None
+
+    h = _sha256(norm)
+    return (
+        DatasetSample.objects
+        .filter(content_hash=h, preprocess_version=DEFAULT_PREPROCESS_VERSION, source="thread")
+        .order_by("-created_at", "-id")
+        .first()
+    )
+
+
+def _latest_preds_for_sample(sample: DatasetSample, dictionary: Optional[Dictionary]) -> list[dict]:
+    """
+    Pobierz NAJNOWSZE predykcje per kind dla wskazanej próbki.
+    Wersja dla PostgreSQL (distinct on). Jeśli nie używasz PG, zamień na deduplikację w Pythonie.
+    """
+    qs = (
+        ModelPrediction.objects
+        .filter(sample=sample, model_name=OPENAI_MODEL_NAME, model_version=OPENAI_MODEL_VERSION)
+        .select_related("kind", "value")
+    )
     if hasattr(ModelPrediction, "dictionary_id") and dictionary is not None:
         qs = qs.filter(dictionary=dictionary)
 
-    # najnowszy per kind
     qs = qs.order_by("kind_id", "-created_at", "-id").distinct("kind_id")
 
     return [
@@ -1165,41 +1195,64 @@ def get_latest_openai_preds_for_email_postgres(
     ]
 
 
-def get_latest_openai_preds_for_email_portable(
-    message_id: int,
-    *,
-    dictionary: Optional[Dictionary] = None,
-) -> list[dict]:
+class LatestModelPredictView(APIView):
     """
-    Wersja przenośna (bez DISTINCT ON): deduplikacja w Pythonie.
+    GET /api/label/latest?message_id=123
+    GET /api/label/latest?thread_id=456
+    (opcjonalnie) &dictionary_code=aiinvite&version=v1&locale=pl
+
+    Zwraca:
+    {
+      "scope": "message" | "thread",
+      "message_id": 123?,    # gdy scope=message
+      "thread_id": 456?,     # gdy scope=thread
+      "labels": [ {kind_code, kind_id, value_code, value_id, snippet, proba, created_at}, ... ]
+    }
     """
-    sample = _resolve_sample_for_email(message_id)
-    if not sample:
-        return []
+    permission_classes = [permissions.IsAuthenticated]
 
-    qs = ModelPrediction.objects.filter(
-        sample=sample,
-        model_name=OPENAI_MODEL_NAME,
-        model_version=OPENAI_MODEL_VERSION,
-    ).select_related("kind", "value").order_by("kind_id", "-created_at", "-id")
+    def get(self, request, *args, **kwargs):
+        message_id_param = request.query_params.get("message_id")
+        thread_id_param = request.query_params.get("thread_id")
 
-    if hasattr(ModelPrediction, "dictionary_id") and dictionary is not None:
-        qs = qs.filter(dictionary=dictionary)
+        # Walidacja: dokładnie jeden z parametrów
+        if bool(message_id_param) == bool(thread_id_param):
+            return Response(
+                {"detail": "Podaj dokładnie jeden parametr: message_id LUB thread_id."},
+                status=400,
+            )
 
-    seen = set()
-    out = []
-    for p in qs:
-        if p.kind_id in seen:
-            continue
-        seen.add(p.kind_id)
-        out.append({
-            "kind_id": p.kind_id,
-            "kind_code": p.kind.code,
-            "value_id": p.value_id,
-            "value_code": p.value.code,
-            "snippet": p.evidence_snippet or "",
-            "proba": p.proba,
-            "created_at": p.created_at,
-        })
-    return out
+        # Opcjonalny słownik (do separacji cache)
+        dictionary = _resolve_dictionary(
+            request.query_params.get("dictionary_code"),
+            request.query_params.get("version"),
+            request.query_params.get("locale"),
+        )
+
+        # MESSAGE
+        if message_id_param:
+            try:
+                message_id = int(message_id_param)
+            except (TypeError, ValueError):
+                return Response({"detail": "Nieprawidłowy message_id."}, status=400)
+
+            sample = _resolve_sample_for_email(message_id)
+            if not sample:
+                return Response({"scope": "message", "message_id": message_id, "labels": []}, status=200)
+
+            rows = _latest_preds_for_sample(sample, dictionary)
+            return Response({"scope": "message", "message_id": message_id, "labels": rows}, status=200)
+
+        # THREAD
+        try:
+            thread_id = int(thread_id_param)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return Response({"detail": "Nieprawidłowy thread_id."}, status=400)
+
+        sample = _resolve_sample_for_thread(thread_id)
+        if not sample:
+            return Response({"scope": "thread", "thread_id": thread_id, "labels": []}, status=200)
+
+        rows = _latest_preds_for_sample(sample, dictionary)
+        return Response({"scope": "thread", "thread_id": thread_id, "labels": rows}, status=200)
 

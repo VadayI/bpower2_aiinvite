@@ -11,7 +11,7 @@ from .views import (
     ThreadViewSet,
     LabelPreviewMessageView,
     LabelPreviewThreadView,
-    LatestModelPredsForEmailView
+    LatestModelPredictView
 )
 
 router = DefaultRouter()
@@ -30,5 +30,5 @@ urlpatterns = [
     path("api-auth/", include("rest_framework.urls")),                # sesyjne logowanie /api-auth/login/
     path("label/preview/message", LabelPreviewMessageView.as_view(), name="label-preview-message"),
     path("label/preview/thread", LabelPreviewThreadView.as_view(), name="label-preview-thread"),
-    path("label/latest", LatestModelPredsForEmailView.as_view(), name="label-latest"),
+    path("label/latest", LatestModelPredictView.as_view(), name="label-latest"),
 ]

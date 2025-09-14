@@ -111,7 +111,7 @@ def build_tool_schema_dynamic(enums: Dict[str, Any]) -> Dict[str, Any]:
             "name": "set_labels",
             "description": (
                 "Zwróć listę etykiet. Każda etykieta musi zawierać 'kind' (kod rodzaju) i 'value' (kod wartości), "
-                "opcjonalnie 'snippet' (fragment treści uzasadniający wybór)."
+                "opcjonalnie 'snippet' (fragment treści uzasadniający wybór, jeśli takich fragmętów jest wiele to każdy zwracaj z nowego wiersza)."
             ),
             "parameters": {
                 "type": "object",

@@ -14,24 +14,25 @@ import os
 from pathlib import Path
 import environ
 
-env = environ.Env(
-    DEBUG=(bool, False)
-)
-
-OPENAI_MODEL_NAME = env('OPENAI_MODEL_NAME', default='')
-OPENAI_MODEL_VERSION = env('OPENAI_MODEL_VERSION', default='')
-DEFAULT_PREPROCESS_VERSION = env('DEFAULT_PREPROCESS_VERSION', default='')
-OPENAI_API_KEY = env('OPENAI_API_KEY', default='')
-MAX_CHARS_THREAD = env('MAX_CHARS_THREAD', default='')
-DICTIONARY_NAME_SET = env('DICTIONARY_NAME_SET', default='')
-DICTIONARY_CODE_SET = env('DICTIONARY_CODE_SET', default='')
-DICTIONARY_DESC_SET = env('DICTIONARY_DESC_SET', default='')
-DEFAULT_PREPROCESS_LOCALE = env('DEFAULT_PREPROCESS_LOCALE', default='')
 
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+
 environ.Env.read_env(os.path.join(BASE_DIR, '.env'))
+env = environ.Env(
+    DEBUG=(bool, False)
+)
+
+OPENAI_MODEL_NAME = env('OPENAI_MODEL_NAME')
+OPENAI_MODEL_VERSION = env('OPENAI_MODEL_VERSION')
+DEFAULT_PREPROCESS_VERSION = env('DEFAULT_PREPROCESS_VERSION')
+OPENAI_API_KEY = env('OPENAI_API_KEY')
+MAX_CHARS_THREAD = env('MAX_CHARS_THREAD')
+DICTIONARY_NAME_SET = env('DICTIONARY_NAME_SET')
+DICTIONARY_CODE_SET = env('DICTIONARY_CODE_SET')
+DICTIONARY_DESC_SET = env('DICTIONARY_DESC_SET')
+DEFAULT_PREPROCESS_LOCALE = env('DEFAULT_PREPROCESS_LOCALE')
 
 
 # Quick-start development settings - unsuitable for production
